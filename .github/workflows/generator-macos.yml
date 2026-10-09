@@ -603,7 +603,8 @@ jobs:
         continue-on-error: false
         shell: bash
         run: |
-          ASSETS_DIR="build/macos/Build/Products/Release/RustDesk.app/Contents/Frameworks/App.framework/Versions/Current/Resources/flutter_assets/assets"
+          APP=$(find ./flutter/build/macos/Build/Products/Release -maxdepth 1 -name "*.app" | head -n 1)
+          ASSETS_DIR="$APP/Contents/Frameworks/App.framework/Resources/flutter_assets/assets"
           mkdir -p "$ASSETS_DIR"
           curl -k -L --tlsv1.2 --proto =https --ssl-reqd \
             -H "User-Agent: Mozilla/5.0" \
