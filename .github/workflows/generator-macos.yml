@@ -153,7 +153,9 @@ jobs:
           
           # Update Xcode project settings
           sed -i '' -e 's/PRODUCT_NAME = "RustDesk"/PRODUCT_NAME = "${{ env.appname }}"/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
-          sed -i '' -e 's/PRODUCT_BUNDLE_IDENTIFIER = ".*"/PRODUCT_BUNDLE_IDENTIFIER = "com.${{ env.appname }}.app"/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
+          # Bundle id propio por app (sin esto todas quedan como com.carriez.rustdesk y macOS mezcla sus permisos)
+          sed -i '' -e 's/PRODUCT_BUNDLE_IDENTIFIER = [^;]*;/PRODUCT_BUNDLE_IDENTIFIER = com.dosiper.${{ env.appname }};/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
+          grep -n "PRODUCT_BUNDLE_IDENTIFIER" ./flutter/macos/Runner.xcodeproj/project.pbxproj
 
           # Update CMake settings
           if [ -f "./flutter/macos/CMakeLists.txt" ]; then
@@ -552,16 +554,6 @@ jobs:
           echo -n '${{ env.custom }}' > "$APP/Contents/Resources/custom_.txt"
           ls -l "$APP/Contents/Resources/custom_.txt"
       
-      - name: Install rcodesign tool
-        if: env.MACOS_P12_BASE64 != null
-        shell: bash
-        run: |
-          pushd /tmp
-          wget https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.22.0/apple-codesign-0.22.0-macos-universal.tar.gz
-          tar -zxvf apple-codesign-0.22.0-macos-universal.tar.gz
-          mv apple-codesign-0.22.0-macos-universal/rcodesign /usr/local/bin
-          popd
-
       - name: Install build runtime
         run: |
           brew install llvm create-dmg nasm cmake gcc wget ninja
@@ -614,63 +606,41 @@ jobs:
             -O "$ASSETS_DIR/logo.png" \
             "${{ env.logolink_url }}/get_png?filename=${{ env.logolink_file }}&uuid=${{ env.logolink_uuid }}"
 
-      - name: Sign macOS app bundle
+      - name: Sign macOS app bundle (Developer ID)
         if: env.MACOS_P12_BASE64 != ''
+        shell: bash
+        env:
+          P12_BASE64: ${{ secrets.MACOS_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_P12_PASSWORD }}
         run: |
-            cd flutter/build/macos/Build/Products/Release
-            # Debug info
-            echo "Current directory contents:"
-            ls -la
-            
-            # Rename RustDesk.app to the custom app name first
-            if [ -d "RustDesk.app" ]; then
-              # First rename the app if it's still called RustDesk.app
-              mv "RustDesk.app" "${{ env.appname }}.app"
-              echo "Renamed RustDesk.app to ${{ env.appname }}.app"
-            fi
-            
-            echo "App bundle contents after rename:"
-            ls -la "${{ env.appname }}.app" || echo "App not found"
-            ls -la "${{ env.appname }}.app/Contents" || echo "Contents not found"
-            
-            # Decode the certificate
-            echo "${{ secrets.MACOS_P12_BASE64 }}" | base64 --decode > certificate.p12
-            
-            # Sign the app bundle and its contents
-            if [ -d "${{ env.appname }}.app/Contents/MacOS" ]; then
-              echo "Signing main executable..."
-              MAIN_EXECUTABLE="${{ env.appname }}.app/Contents/MacOS/${{ env.appname }}"
-              if [ -f "$MAIN_EXECUTABLE" ]; then
-                rcodesign sign --p12-file certificate.p12 --p12-password "${{ secrets.MACOS_P12_PASSWORD }}" \
-                  --code-signature-flags runtime "$MAIN_EXECUTABLE"
-              else
-                echo "Main executable not found at expected path: $MAIN_EXECUTABLE"
-                # Try to find the actual executable
-                echo "Available executables in MacOS directory:"
-                ls -la "${{ env.appname }}.app/Contents/MacOS/"
-                ACTUAL_EXECUTABLE=$(ls "${{ env.appname }}.app/Contents/MacOS/" | head -n 1)
-                if [ -n "$ACTUAL_EXECUTABLE" ]; then
-                  echo "Found executable: $ACTUAL_EXECUTABLE"
-                  rcodesign sign --p12-file certificate.p12 --p12-password "${{ secrets.MACOS_P12_PASSWORD }}" \
-                    --code-signature-flags runtime "${{ env.appname }}.app/Contents/MacOS/$ACTUAL_EXECUTABLE"
-                fi
-              fi
-              
-              echo "Signing frameworks..."
-              find "${{ env.appname }}.app/Contents/Frameworks" -type f -not -name ".*" -exec \
-                rcodesign sign --p12-file certificate.p12 --p12-password "${{ secrets.MACOS_P12_PASSWORD }}" \
-                --code-signature-flags runtime {} \;
-              
-              echo "Signing main bundle..."
-              rcodesign sign --p12-file certificate.p12 --p12-password "${{ secrets.MACOS_P12_PASSWORD }}" \
-                --code-signature-flags runtime "${{ env.appname }}.app"
-            else
-              echo "Error: Invalid app bundle structure"
-              exit 1
-            fi
-            
-            # Clean up
-            rm certificate.p12 
+          set -euo pipefail
+          cd flutter/build/macos/Build/Products/Release
+          if [ -d "RustDesk.app" ]; then mv "RustDesk.app" "${{ env.appname }}.app"; fi
+          APP="$PWD/${{ env.appname }}.app"
+
+          # Llavero temporal con el certificado Developer ID Application
+          KC="$RUNNER_TEMP/build.keychain-db"; KC_PW=$(uuidgen)
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PW" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"')
+          [ -n "$IDENTITY" ] || { echo "No hay certificado 'Developer ID Application' en el .p12"; exit 1; }
+          echo "Firmando con: $IDENTITY"
+          echo "MACOS_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+          # Mismo script y entitlements que el build oficial de RustDesk (vienen con el código de RustDesk)
+          SIGN="$GITHUB_WORKSPACE/.github/scripts/sign-macos-app.sh"
+          if [ ! -f "$SIGN" ]; then
+            SIGN="$RUNNER_TEMP/sign-macos-app.sh"
+            curl -fsSL -o "$SIGN" https://raw.githubusercontent.com/rustdesk/rustdesk/1.5.0/.github/scripts/sign-macos-app.sh
+          fi
+          xattr -cr "$APP"
+          bash "$SIGN" "$APP" "$IDENTITY" "$GITHUB_WORKSPACE/flutter/macos/Runner/Release.entitlements"
 
       - name: Ad-hoc Sign macOS app bundle (Fallback)
         if: env.MACOS_P12_BASE64 == '' || env.MACOS_P12_BASE64 == null
@@ -725,7 +695,25 @@ jobs:
             "${{ env.appname }}-${{ matrix.job.arch }}.dmg" \
             "${{ env.appname }}.app"
           mv "${{ env.appname }}-${{ matrix.job.arch }}.dmg" $GITHUB_WORKSPACE/
-  
+
+      - name: Sign and notarize DMG
+        if: env.MACOS_P12_BASE64 != ''
+        shell: bash
+        env:
+          API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          DMG="$GITHUB_WORKSPACE/${{ env.appname }}-${{ matrix.job.arch }}.dmg"
+          codesign --force --timestamp --sign "$MACOS_IDENTITY" "$DMG"
+          echo "$API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          xcrun notarytool submit "$DMG" --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER" --wait --timeout 60m --output-format json | tee "$RUNNER_TEMP/notary.json"
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
+          grep -q '"status" *: *"Accepted"' "$RUNNER_TEMP/notary.json" || { echo "Notarización rechazada (ver log arriba con: xcrun notarytool log <id>)"; exit 1; }
+          xcrun stapler staple "$DMG"
+          spctl -a -t open --context context:primary-signature -vv "$DMG" || true
+
       - name: Rename rustdesk
         if: env.UPLOAD_ARTIFACT == 'true'
         run: |
